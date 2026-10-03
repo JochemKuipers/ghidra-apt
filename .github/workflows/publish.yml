@@ -1,0 +1,106 @@
+name: Build and release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream NationalSecurityAgency/ghidra tag (empty = latest release)
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 4 * * *"
+  push:
+    branches: [main]
+
+concurrency:
+  group: package
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends unzip dpkg
+
+      - name: Fetch and pack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ github.event.inputs.tag }}
+        run: bash scripts/fetch-and-pack.sh
+
+      - name: Record version
+        id: meta
+        run: |
+          echo "tag=$(cat out/upstream-tag.txt)" >> "$GITHUB_OUTPUT"
+          echo "version=$(cat out/version.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload debs
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs
+          path: |
+            out/*.deb
+            out/upstream-tag.txt
+            out/version.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Check existing release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.meta.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        if: steps.release.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.meta.outputs.version }}
+          name: Ghidra ${{ steps.meta.outputs.version }}
+          body: |
+            Unofficial Debian package of [Ghidra ${{ steps.meta.outputs.version }}](https://github.com/NationalSecurityAgency/ghidra/releases/tag/${{ steps.meta.outputs.tag }}),
+            repacked from the official PUBLIC release zip.
+
+            Install from the combined APT repo: https://jochemkuipers.github.io/apt-repo
+          files: |
+            out/ghidra_*.deb
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+
+      - name: Summary
+        run: |
+          {
+            echo "## Ghidra ${{ steps.meta.outputs.version }}"
+            echo
+            if [[ "${{ steps.release.outputs.exists }}" == "true" ]]; then
+              echo "Release \`v${{ steps.meta.outputs.version }}\` already existed; skipped upload."
+            else
+              echo "Published release \`v${{ steps.meta.outputs.version }}\`."
+            fi
+            echo
+            echo "Install from \`https://jochemkuipers.github.io/apt-repo\`"
+            echo
+            echo '```sh'
+            echo 'curl -fsSL https://jochemkuipers.github.io/apt-repo/jochem.sources | sudo tee /etc/apt/sources.list.d/jochem.sources'
+            echo 'sudo apt update'
+            echo 'sudo apt install ghidra'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
