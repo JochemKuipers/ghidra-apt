@@ -1,9 +1,10 @@
 # Ghidra APT package
 
-Unofficial Debian package of [Ghidra](https://github.com/NationalSecurityAgency/ghidra),
-repacked from the official PUBLIC release zip as `ghidra`.
+Unofficial Debian packaging of [Ghidra](https://github.com/NationalSecurityAgency/ghidra),
+repacked from the official PUBLIC release zip.
 
-Install from the combined APT repo:
+Install with `apt install ghidra` (pulls split data packages so each `.deb` stays under
+GitHub’s 100 MiB git limit for the apt-repo Pages pool).
 
 ```sh
 curl -fsSL https://jochemkuipers.github.io/apt-repo/jochem.sources \

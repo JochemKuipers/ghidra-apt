@@ -81,7 +81,7 @@ jobs:
 
             Install from the combined APT repo: https://jochemkuipers.github.io/apt-repo
           files: |
-            out/ghidra_*.deb
+            out/ghidra*.deb
           fail_on_unmatched_files: true
           generate_release_notes: false
 

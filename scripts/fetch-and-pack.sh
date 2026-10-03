@@ -7,6 +7,8 @@ WORKDIR="${WORKDIR:-${ROOT}/.work}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-NationalSecurityAgency/ghidra}"
 UPSTREAM_TAG="${UPSTREAM_TAG:-}"
 DEBIAN_REVISION="${DEBIAN_REVISION:-1}"
+# GitHub rejects git blobs over 100 MiB (gh-pages pool). Keep each .deb under this.
+MAX_DEB_BYTES="${MAX_DEB_BYTES:-$((100 * 1024 * 1024))}"
 
 mkdir -p "${OUT}" "${WORKDIR}"
 rm -rf "${OUT:?}"/* "${WORKDIR:?}"/*
@@ -22,6 +24,7 @@ need gh
 need sha256sum
 need unzip
 need dpkg-deb
+need rsync
 
 if [[ -z "${UPSTREAM_TAG}" ]]; then
   UPSTREAM_TAG="$(gh release view -R "${UPSTREAM_REPO}" --json tagName -q .tagName)"
@@ -54,7 +57,6 @@ fi
 zip_file="${zips[0]}"
 zip_base="$(basename "${zip_file}")"
 
-# Prefer digest from GitHub API; fall back to SHA-256 in release body.
 expected="$(
   gh release view -R "${UPSTREAM_REPO}" "${UPSTREAM_TAG}" --json assets \
     -q ".assets[] | select(.name == \"${zip_base}\") | .digest" \
@@ -92,40 +94,201 @@ if (( ${#inners[@]} != 1 )); then
   ls -la "${extract_dir}" >&2 || true
   exit 1
 fi
-inner="${inners[0]}"
+SRC="${inners[0]}"
 
-if [[ ! -x "${inner}/ghidraRun" ]]; then
-  echo "missing ghidraRun in ${inner}" >&2
+if [[ ! -x "${SRC}/ghidraRun" ]]; then
+  echo "missing ghidraRun in ${SRC}" >&2
   exit 1
 fi
 
-staging="${WORKDIR}/staging"
-mkdir -p "${staging}/opt/ghidra"
-mkdir -p "${staging}/usr/bin"
-mkdir -p "${staging}/usr/share/applications"
-mkdir -p "${staging}/DEBIAN"
-
-# Move contents (not the versioned folder name) into /opt/ghidra.
-shopt -s dotglob
-mv "${inner}"/* "${staging}/opt/ghidra/"
-shopt -u dotglob
-
-cat > "${staging}/usr/bin/ghidra" <<'EOF'
-#!/bin/sh
-exec /opt/ghidra/ghidraRun "$@"
-EOF
-chmod 755 "${staging}/usr/bin/ghidra"
-chmod 755 "${staging}/opt/ghidra/ghidraRun"
-
 # Prefer PNG icons if present; fall back to support/ghidra.ico.
 icon_path="/opt/ghidra/support/ghidra.ico"
-if [[ -f "${staging}/opt/ghidra/docs/images/GHIDRA_1.png" ]]; then
+if [[ -f "${SRC}/docs/images/GHIDRA_1.png" ]]; then
   icon_path="/opt/ghidra/docs/images/GHIDRA_1.png"
-elif [[ -f "${staging}/opt/ghidra/docs/GhidraClass/Beginner/Images/GhidraLogo64.png" ]]; then
+elif [[ -f "${SRC}/docs/GhidraClass/Beginner/Images/GhidraLogo64.png" ]]; then
   icon_path="/opt/ghidra/docs/GhidraClass/Beginner/Images/GhidraLogo64.png"
 fi
 
-cat > "${staging}/usr/share/applications/ghidra.desktop" <<EOF
+DATA_PACKAGES=(
+  ghidra-base
+  ghidra-functionid
+  ghidra-bsim
+  ghidra-features
+  ghidra-debug
+  ghidra-framework
+  ghidra-docs
+  ghidra-extensions
+  ghidra-jython
+)
+depends_list="openjdk-21-jdk | openjdk-21-jre, python3, bash, libgtk-3-0 | libgtk-3-0t64"
+for pkg in "${DATA_PACKAGES[@]}"; do
+  depends_list+=", ${pkg} (= ${DEB_VERSION})"
+done
+
+build_deb() {
+  local pkg="$1"
+  local desc="$2"
+  local staging="$3"
+  shift 3
+  # remaining args: extra Depends fields (optional single string)
+  local extra_depends="${1:-}"
+
+  mkdir -p "${staging}/DEBIAN"
+
+  local installed_size
+  installed_size="$(du -sk "${staging}" --exclude=DEBIAN 2>/dev/null | awk '{ print $1 }')"
+  if [[ -z "${installed_size}" ]]; then
+    installed_size=0
+  fi
+
+  {
+    echo "Package: ${pkg}"
+    echo "Version: ${DEB_VERSION}"
+    echo "Section: devel"
+    echo "Priority: optional"
+    echo "Architecture: amd64"
+    echo "Maintainer: Jochem Kuipers <jochem@kuipers.cc>"
+    echo "Installed-Size: ${installed_size}"
+    if [[ -n "${extra_depends}" ]]; then
+      echo "Depends: ${extra_depends}"
+    fi
+    echo "Homepage: https://github.com/NationalSecurityAgency/ghidra"
+    echo "Description: ${desc}"
+    if [[ "${pkg}" == "ghidra" ]]; then
+      cat <<'EOF'
+ Unofficial Debian packaging of Ghidra, the software reverse engineering
+ (SRE) framework from the National Security Agency Research Directorate.
+ .
+ Split into several .deb parts so each stays under GitHub's 100 MiB
+ git limit for the apt-repo Pages pool. Install with: apt install ghidra
+ .
+ Upstream: https://github.com/NationalSecurityAgency/ghidra
+EOF
+    else
+      cat <<EOF
+ Data package for unofficial Ghidra ${VERSION} (${pkg}).
+ .
+ Pulled in automatically by the ghidra metapackage; not meant to be
+ installed alone.
+EOF
+    fi
+  } > "${staging}/DEBIAN/control"
+
+  local out_deb="${OUT}/${pkg}_${DEB_VERSION}_amd64.deb"
+  dpkg-deb --root-owner-group -Zxz -b "${staging}" "${out_deb}"
+
+  local size
+  size="$(stat -c '%s' "${out_deb}")"
+  if (( size >= MAX_DEB_BYTES )); then
+    echo "ERROR: ${out_deb} is ${size} bytes (>= ${MAX_DEB_BYTES}); exceeds GitHub git limit" >&2
+    exit 1
+  fi
+  echo "Wrote ${out_deb} ($(( size / 1024 / 1024 )) MiB)"
+}
+
+stage_paths() {
+  local staging="$1"
+  shift
+  local rel
+  for rel in "$@"; do
+    local src="${SRC}/${rel}"
+    if [[ ! -e "${src}" ]]; then
+      echo "missing path in upstream tree: ${rel}" >&2
+      exit 1
+    fi
+    local dest="${staging}/opt/ghidra/$(dirname "${rel}")"
+    mkdir -p "${dest}"
+    cp -a "${src}" "${dest}/"
+  done
+}
+
+# --- data packages (paths relative to upstream root) ---
+
+s="${WORKDIR}/stage-ghidra-base"
+rm -rf "${s}"
+stage_paths "${s}" Ghidra/Features/Base
+build_deb ghidra-base "Ghidra Base feature data (unofficial)" "${s}"
+
+s="${WORKDIR}/stage-ghidra-functionid"
+rm -rf "${s}"
+stage_paths "${s}" Ghidra/Features/FunctionID
+build_deb ghidra-functionid "Ghidra FunctionID data (unofficial)" "${s}"
+
+s="${WORKDIR}/stage-ghidra-bsim"
+rm -rf "${s}"
+stage_paths "${s}" Ghidra/Features/BSim
+build_deb ghidra-bsim "Ghidra BSim feature data (unofficial)" "${s}"
+
+s="${WORKDIR}/stage-ghidra-features"
+rm -rf "${s}"
+mkdir -p "${s}/opt/ghidra/Ghidra/Features"
+rsync -a \
+  --exclude Base \
+  --exclude FunctionID \
+  --exclude BSim \
+  "${SRC}/Ghidra/Features/" "${s}/opt/ghidra/Ghidra/Features/"
+build_deb ghidra-features "Ghidra remaining Features data (unofficial)" "${s}"
+
+s="${WORKDIR}/stage-ghidra-debug"
+rm -rf "${s}"
+stage_paths "${s}" Ghidra/Debug
+build_deb ghidra-debug "Ghidra Debug components (unofficial)" "${s}"
+
+s="${WORKDIR}/stage-ghidra-framework"
+rm -rf "${s}"
+stage_paths "${s}" \
+  Ghidra/Framework \
+  Ghidra/Processors \
+  Ghidra/Configurations \
+  Ghidra/application.properties \
+  Ghidra/patch
+# empty Extensions placeholder used by upstream layout
+mkdir -p "${s}/opt/ghidra/Ghidra/Extensions"
+build_deb ghidra-framework "Ghidra Framework and Processors (unofficial)" "${s}"
+
+s="${WORKDIR}/stage-ghidra-docs"
+rm -rf "${s}"
+stage_paths "${s}" docs
+build_deb ghidra-docs "Ghidra documentation (unofficial)" "${s}"
+
+s="${WORKDIR}/stage-ghidra-jython"
+rm -rf "${s}"
+mkdir -p "${s}/opt/ghidra/Extensions/Ghidra"
+shopt -s nullglob
+jython_zips=("${SRC}/Extensions/Ghidra/"*Jython.zip)
+if (( ${#jython_zips[@]} != 1 )); then
+  echo "expected exactly one Jython extension zip, found ${#jython_zips[@]}" >&2
+  exit 1
+fi
+cp -a "${jython_zips[0]}" "${s}/opt/ghidra/Extensions/Ghidra/"
+shopt -u nullglob
+build_deb ghidra-jython "Ghidra Jython extension (unofficial)" "${s}"
+
+s="${WORKDIR}/stage-ghidra-extensions"
+rm -rf "${s}"
+mkdir -p "${s}/opt/ghidra/Extensions"
+rsync -a --exclude '*Jython.zip' "${SRC}/Extensions/" "${s}/opt/ghidra/Extensions/"
+build_deb ghidra-extensions "Ghidra bundled extensions (unofficial)" "${s}"
+
+# --- main package: launcher + small runtime bits ---
+s="${WORKDIR}/stage-ghidra"
+rm -rf "${s}"
+mkdir -p "${s}/opt/ghidra" "${s}/usr/bin" "${s}/usr/share/applications"
+for rel in GPL support licenses server bom.json docker \
+  GettingStarted.html GettingStarted.md LICENSE ghidraRun ghidraRun.bat; do
+  if [[ -e "${SRC}/${rel}" ]]; then
+    cp -a "${SRC}/${rel}" "${s}/opt/ghidra/"
+  fi
+done
+chmod 755 "${s}/opt/ghidra/ghidraRun"
+
+cat > "${s}/usr/bin/ghidra" <<'EOF'
+#!/bin/sh
+exec /opt/ghidra/ghidraRun "$@"
+EOF
+chmod 755 "${s}/usr/bin/ghidra"
+
+cat > "${s}/usr/share/applications/ghidra.desktop" <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
@@ -139,34 +302,10 @@ Keywords=reverse;engineering;disassembler;decompiler;
 StartupWMClass=ghidra-Ghidra
 EOF
 
-installed_size="$(du -sk "${staging}/opt" "${staging}/usr" | awk '{ s += $1 } END { print s }')"
-
-cat > "${staging}/DEBIAN/control" <<EOF
-Package: ghidra
-Version: ${DEB_VERSION}
-Section: devel
-Priority: optional
-Architecture: amd64
-Maintainer: Jochem Kuipers <jochem@kuipers.cc>
-Installed-Size: ${installed_size}
-Depends: openjdk-21-jdk | openjdk-21-jre, python3, bash, libgtk-3-0 | libgtk-3-0t64
-Homepage: https://github.com/NationalSecurityAgency/ghidra
-Description: NSA Ghidra software reverse engineering framework (unofficial)
- Unofficial Debian package of Ghidra, the software reverse engineering
- (SRE) framework from the National Security Agency Research Directorate.
- .
- Includes disassembly, decompilation, graphing, and scripting. Repacked
- from the official PUBLIC release zip; not affiliated with the NSA.
- .
- Upstream: https://github.com/NationalSecurityAgency/ghidra
-EOF
-
-out_deb="${OUT}/ghidra_${DEB_VERSION}_amd64.deb"
-# xz compression keeps the ~550MB artifact manageable for GitHub Releases / Pages.
-dpkg-deb --root-owner-group -Zxz -b "${staging}" "${out_deb}"
+build_deb ghidra "NSA Ghidra software reverse engineering framework (unofficial)" "${s}" "${depends_list}"
 
 printf '%s\n' "${VERSION}" > "${OUT}/version.txt"
 printf '%s\n' "${UPSTREAM_TAG}" > "${OUT}/upstream-tag.txt"
 
-echo "Wrote ${out_deb}"
+echo "Built packages:"
 ls -lh "${OUT}"/*.deb
