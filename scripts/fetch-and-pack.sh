@@ -163,7 +163,7 @@ EOF
 
 out_deb="${OUT}/ghidra_${DEB_VERSION}_amd64.deb"
 # xz compression keeps the ~550MB artifact manageable for GitHub Releases / Pages.
-dpkg-deb -Zxz -b "${staging}" "${out_deb}"
+dpkg-deb --root-owner-group -Zxz -b "${staging}" "${out_deb}"
 
 printf '%s\n' "${VERSION}" > "${OUT}/version.txt"
 printf '%s\n' "${UPSTREAM_TAG}" > "${OUT}/upstream-tag.txt"
